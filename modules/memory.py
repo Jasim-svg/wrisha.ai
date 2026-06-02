@@ -130,23 +130,31 @@ class Memory:
                 lines.append(f"  {i}. {fact}")
         return "\n".join(lines) if lines else ""
 
-    def extract_facts_from_text(self, text: str, gemini_chat) -> list[str]:
+    def extract_facts_from_text(self, text: str, generate_fn) -> list[str]:
         """
-        Asks Gemini to extract memorable facts from the user's message.
+        Extracts memorable facts from the user's message via generate_fn.
+        generate_fn(messages: list[dict]) -> str
         Returns a list of concise fact strings (may be empty).
         """
-        if not text or not gemini_chat:
+        if not text or not generate_fn:
             return []
         try:
-            extraction_prompt = (
-                f"Extract any personal facts about the user from this message that Wrisha should remember long-term. "
-                f"Examples: name, job, hobbies, preferences, family, location. "
-                f"Reply with a JSON list of short fact strings, or an empty list [] if nothing notable. "
-                f"Message: \"{text}\""
-            )
-            resp = gemini_chat.send_message(extraction_prompt)
-            raw = resp.text.strip()
-            # Strip markdown code fences if present
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a fact extractor. Extract personal facts about the user "
+                        "from the message below that an AI companion should remember long-term. "
+                        "Examples: name, job, hobbies, preferences, family, location. "
+                        "Reply with a JSON list of short fact strings only, or [] if nothing notable."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Message: \"{text}\"",
+                },
+            ]
+            raw = generate_fn(messages)
             raw = raw.replace("```json", "").replace("```", "").strip()
             facts = json.loads(raw)
             if isinstance(facts, list):

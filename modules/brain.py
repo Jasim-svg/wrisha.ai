@@ -1,19 +1,12 @@
 """
 modules/brain.py — AI Brain for Wrisha v3.0
 
-Connects to Google Gemini with:
-  - Rich persona and backstory
-  - Persistent memory injection
-  - Sliding window conversation context (last 20 turns)
-  - Emotion-aware response style
-  - Proactive idle messages
-  - Extended emotion set
-  - Robust response parsing
+Dual-provider design: Gemini (primary) → DeepSeek (fallback).
+Maintains rolling message history; no stateful SDK chat session.
 """
 
-import google.generativeai as genai
 import random
-import time
+import re
 import config
 from modules.memory import Memory
 from modules.mood_engine import MoodEngine
@@ -31,11 +24,11 @@ _IDLE_LINES = [
     "excited|Ooh! I had an idea — want to play 20 questions?",
 ]
 
-# ── System Prompt Builder ─────────────────────────────────────────────────────
+
 def _build_system_prompt(memory: Memory, mood_engine: MoodEngine) -> str:
-    mem_block   = memory.get_prompt_block()
-    mood_hint   = mood_engine.get_context_hint()
-    valid_set   = ", ".join(sorted(config.VALID_EMOTIONS - {"talking"}))
+    mem_block  = memory.get_prompt_block()
+    mood_hint  = mood_engine.get_context_hint()
+    valid_set  = ", ".join(sorted(config.VALID_EMOTIONS - {"talking"}))
 
     return f"""
 {config.PERSONA_DESCRIPTION}
@@ -66,126 +59,97 @@ Rules:
 
 
 class Brain:
-    """
-    Wrisha's AI brain powered by Google Gemini.
-    """
+    def __init__(self, memory: Memory, mood_engine: MoodEngine, provider_manager=None):
+        self.memory         = memory
+        self.mood_engine    = mood_engine
+        self._messages: list[dict] = []  # rolling window: system + turns
 
-    def __init__(self, memory: Memory, mood_engine: MoodEngine):
-        self.memory      = memory
-        self.mood_engine = mood_engine
-        self.model       = None
-        self.chat        = None
-        self._history    = []          # list of (role, text) tuples for context
+        if provider_manager is None:
+            from providers.manager import ProviderManager
+            provider_manager = ProviderManager()
+        self.provider_manager = provider_manager
 
-        # Try connecting to Gemini
-        api_key = config.GEMINI_API_KEY
-        if not api_key or "YOUR_API_KEY" in api_key:
-            print("Brain: WARNING — Gemini API Key not set. Using fallback mode.")
-            return
+        self._rebuild_system_prompt()
+        print("Brain: ✅ ready")
 
-        try:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(config.GEMINI_MODEL)
-            self._start_chat()
-            print(f"Brain: ✅ Gemini connected ({config.GEMINI_MODEL})")
-        except Exception as e:
-            print(f"Brain: ❌ Connection error — {e}")
-            self.model = None
+    # ─── System prompt management ─────────────────────────────────
 
-    # ─── Chat Management ────────────────────────────────────────
+    def _rebuild_system_prompt(self):
+        sys_content = _build_system_prompt(self.memory, self.mood_engine)
+        if self._messages and self._messages[0]["role"] == "system":
+            self._messages[0]["content"] = sys_content
+        else:
+            self._messages.insert(0, {"role": "system", "content": sys_content})
 
-    def _start_chat(self):
-        """Start (or restart) a Gemini chat session with system context."""
-        sys_prompt = _build_system_prompt(self.memory, self.mood_engine)
-        self.chat = self.model.start_chat(history=[
-            {"role": "user",  "parts": sys_prompt},
-            {"role": "model", "parts": "understood|Sure! I'm ready. Let's talk! 💫"},
-        ])
-
-    def _refresh_system_prompt(self):
-        """Rebuild system context after memory updates."""
-        if self.model:
-            try:
-                self._start_chat()
-            except Exception as e:
-                print(f"Brain: refresh error — {e}")
-
-    # ─── Main Processing ────────────────────────────────────────
+    # ─── Main Processing ──────────────────────────────────────────
 
     def process(self, user_text: str, user_emotion: str) -> tuple[str, str, bool]:
-        """
-        Process user input and return (response_text, target_mood, should_exit).
-        """
-        should_exit   = False
-        target_mood   = self.mood_engine.current
-        response_text = ""
-
         if not user_text:
-            return "", target_mood, False
+            return "", self.mood_engine.current, False
 
-        # ── Exit detection ───────────────────────────────────────
+        # Exit detection
         text_lower = user_text.lower().strip()
         exit_words = {"exit", "bye", "goodbye", "quit", "close", "see you"}
         if any(w in text_lower for w in exit_words):
             name = f", {self.memory.user_name}!" if self.memory.user_name else "!"
             return f"Aww, goodbye{name} I'll miss you! Come back soon~ 💕", "sad", True
 
-        if not self.model:
+        if not self.provider_manager.any_available():
             return self._fallback(user_text, user_emotion), "neutral", False
 
-        # ── Build prompt ─────────────────────────────────────────
-        visual_tag   = f"[User looks {user_emotion}] " if user_emotion not in ("neutral", "listening", "") else ""
-        full_prompt  = f"{visual_tag}User: {user_text}"
+        visual_tag  = f"[User looks {user_emotion}] " if user_emotion not in ("neutral", "listening", "") else ""
+        user_content = f"{visual_tag}User: {user_text}"
 
-        # ── Send to Gemini ───────────────────────────────────────
-        try:
-            response  = self.chat.send_message(full_prompt)
-            content   = response.text.strip()
-            target_mood, response_text = self._parse_response(content)
+        # Build messages for this turn
+        messages = self._messages + [{"role": "user", "content": user_content}]
 
-            # ── Memory extraction (async-lite: non-blocking best-effort) ──
-            try:
-                new_facts = self.memory.extract_facts_from_text(user_text, self.chat)
-                if new_facts:
-                    self.memory.add_facts(new_facts)
-                    self._refresh_system_prompt()
-            except Exception:
-                pass
+        content = self.provider_manager.generate(messages)
+        if not content:
+            content = "neutral|My thoughts got a little tangled… can you say that again? 😅"
 
-            # ── Name detection ───────────────────────────────────
-            if not self.memory.user_name:
-                name = self._detect_name(user_text)
-                if name:
-                    self.memory.user_name = name
-                    self._refresh_system_prompt()
-
-            self._history.append(("user",  user_text))
-            self._history.append(("model", response_text))
-            # Trim history
-            if len(self._history) > config.CONTEXT_WINDOW * 2:
-                self._history = self._history[-(config.CONTEXT_WINDOW * 2):]
-
-        except Exception as e:
-            print(f"Brain: Gemini error — {e}")
-            response_text = "My thoughts got a little tangled… can you say that again? 😅"
-            target_mood   = "sad"
-
+        target_mood, response_text = self._parse_response(content)
         self.mood_engine.set_target(target_mood)
-        return response_text, target_mood, should_exit
 
-    # ─── Proactive / Idle ───────────────────────────────────────
+        # Memory extraction (best-effort, non-blocking)
+        try:
+            new_facts = self.memory.extract_facts_from_text(
+                user_text, self.provider_manager.generate
+            )
+            if new_facts:
+                self.memory.add_facts(new_facts)
+                self._rebuild_system_prompt()
+        except Exception:
+            pass
+
+        # Name detection
+        if not self.memory.user_name:
+            name = self._detect_name(user_text)
+            if name:
+                self.memory.user_name = name
+                self._rebuild_system_prompt()
+
+        # Append to rolling history (after system prompt entry)
+        self._messages.append({"role": "user",      "content": user_content})
+        self._messages.append({"role": "assistant", "content": content})
+
+        # Trim: keep system prompt + last CONTEXT_WINDOW*2 turn messages
+        max_turns = config.CONTEXT_WINDOW * 2
+        if len(self._messages) > 1 + max_turns:
+            self._messages = [self._messages[0]] + self._messages[-(max_turns):]
+
+        return response_text, target_mood, False
+
+    # ─── Proactive / Idle ─────────────────────────────────────────
 
     def proactive_message(self) -> tuple[str, str]:
-        """Returns (response_text, mood) for an unprompted idle message."""
         line = random.choice(_IDLE_LINES)
         mood, text = self._parse_response(line)
         self.mood_engine.set_target(mood)
         return text, mood
 
-    # ─── Helpers ────────────────────────────────────────────────
+    # ─── Helpers ──────────────────────────────────────────────────
 
     def _parse_response(self, content: str) -> tuple[str, str]:
-        """Parse 'EMOTION|text' response. Falls back gracefully."""
         if "|" in content:
             parts = content.split("|", 1)
             mood  = parts[0].strip().lower()
@@ -199,13 +163,11 @@ class Brain:
         name = f" {self.memory.user_name}" if self.memory.user_name else ""
         return (
             f"I heard you{name}! '{user_text}'. "
-            "(Set your Gemini API key in config.py to unlock my full brain~)"
+            "(Add your API keys in .env to unlock my full brain~)"
         )
 
     @staticmethod
     def _detect_name(text: str) -> str | None:
-        """Very simple heuristic: 'my name is X' or 'I'm X' or 'call me X'."""
-        import re
         patterns = [
             r"my name is ([A-Z][a-z]+)",
             r"i[''']?m ([A-Z][a-z]+)",
@@ -216,7 +178,6 @@ class Brain:
             m = re.search(pat, text, re.IGNORECASE)
             if m:
                 candidate = m.group(1).strip()
-                # Filter out common false positives
                 if candidate.lower() not in {"fine", "good", "well", "okay", "here", "back", "from", "not"}:
                     return candidate.capitalize()
         return None

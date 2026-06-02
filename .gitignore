@@ -1,0 +1,23 @@
+# secrets
+.env
+*.env
+!.env.example
+secrets/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# runtime artifacts
+.cache/
+speech_*.mp3
+temp_speech.mp3
+wrisha_memory.json
+
+# os/editor
+.DS_Store
+.idea/
+.vscode/

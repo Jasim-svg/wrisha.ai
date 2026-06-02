@@ -17,6 +17,9 @@ import time
 import threading
 import config
 
+_CACHE_DIR = ".cache"
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
 
 class VoiceSystem:
     def __init__(self):
@@ -60,7 +63,7 @@ class VoiceSystem:
 
     def _speak_worker(self, text: str, mood: str):
         voice, rate, pitch = self._get_voice_style(mood)
-        filename = f"speech_{int(time.time() * 1000)}.mp3"
+        filename = os.path.join(_CACHE_DIR, f"speech_{int(time.time() * 1000)}.mp3")
 
         # Generate audio
         try:
@@ -122,7 +125,7 @@ class VoiceSystem:
 
     def _cleanup_old_files(self):
         """Delete all speech_*.mp3 files left from previous runs."""
-        old_files = glob.glob("speech_*.mp3")
+        old_files = glob.glob(os.path.join(_CACHE_DIR, "speech_*.mp3"))
         for f in old_files:
             try:
                 os.remove(f)
